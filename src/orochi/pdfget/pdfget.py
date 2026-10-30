@@ -166,17 +166,31 @@ class PDFget(OrochiBase):
 
     @property
     def q(self):
-        """Scattering vector grid Q for reduced structure factor F(Q)."""
+        """Scattering vector grid Q for measured structure factors S(Q) and F(Q)."""
+        if self.data and "q" in self.data:
+            return self.data["q"]
+        return self.data.get("q_fq") if self.data else None
+
+    @property
+    def q_fq(self):
+        """Evenly spaced momentum transfer grid Q for Discrete Sine Transform (0 to qmax)."""
         return self.data.get("q_fq") if self.data else None
 
     @property
     def fq(self):
-        """Reduced structure factor F(Q)."""
+        """Measured reduced structure factor F(Q) on the experimental Q grid (no extrapolation)."""
+        return self.data.get("fq") if self.data else None
+
+    @property
+    def fq_grid(self):
+        """Extrapolated reduced structure factor F(Q) on the Fourier transform grid q_fq."""
+        if self.data and "fq_grid" in self.data:
+            return self.data["fq_grid"]
         return self.data.get("fq") if self.data else None
 
     @property
     def sq(self):
-        """Total structure factor S(Q)."""
+        """Total structure factor S(Q) on the measured Q grid (no extrapolation)."""
         return self.data.get("sq") if self.data else None
 
     @property
@@ -409,9 +423,11 @@ class PDFget(OrochiBase):
             ("Gr", "Gr"),
             ("gr", "gr"),
             ("tr", "tr"),
-            ("q_fq", "q"),
-            ("fq", "fq"),
+            ("q", "q"),
             ("sq", "sq"),
+            ("fq", "fq"),
+            ("q_fq", "q_fq"),
+            ("fq_grid", "fq_grid"),
             ("tt", "tt"),
             ("i", "i"),
             ("base_function", "base_function"),
@@ -472,9 +488,11 @@ class PDFget(OrochiBase):
             "Gr": "Gr",
             "gr": "gr",
             "tr": "tr",
-            "q": "q_fq",
-            "fq": "fq",
+            "q": "q",
             "sq": "sq",
+            "fq": "fq",
+            "q_fq": "q_fq",
+            "fq_grid": "fq_grid",
             "tt": "tt",
             "i": "i",
             "base_function": "base_function",
@@ -482,6 +500,12 @@ class PDFget(OrochiBase):
         for json_k, data_k in key_map.items():
             if json_k in data and data[json_k] is not None:
                 self.data[data_k] = np.array(data[json_k])
+
+        # Backward compatibility for old JSON where "q" held q_fq and "fq" held fq_grid
+        if "q_fq" not in self.data and "q" in self.data:
+            self.data["q_fq"] = self.data["q"]
+        if "fq_grid" not in self.data and "fq" in self.data:
+            self.data["fq_grid"] = self.data["fq"]
 
     def save_json(self, file_path):
         """Alias for to_json(file_path)."""
@@ -849,15 +873,16 @@ class PDFget(OrochiBase):
         Parameters
         ----------
         data : dict
-            Data dictionary containing 'q_fq' and 'fq'.
+            Data dictionary containing 'q_fq' and 'fq_grid' (or 'fq').
 
         Returns
         -------
         dict
             Updated dictionary containing 'r', 'Gr', 'gradient', 'tr', and 'gr'.
         """
+        fq_for_dst = data["fq_grid"] if "fq_grid" in data else data["fq"]
         data["r"], data["Gr"] = self.dst_transform(
-            data["q_fq"], data["fq"], self["padding"]
+            data["q_fq"], fq_for_dst, self["padding"]
         )
         rho0 = (
             float(self["number_density"])
@@ -888,11 +913,16 @@ class PDFget(OrochiBase):
         return data
 
     def iq_to_fq(self, data):
-        """Evaluate S(Q) and F(Q) = Q[S(Q) - 1] with optional revised Lorch modification."""
+        """Evaluate S(Q) and F(Q) = Q[S(Q) - 1] on the measured Q grid, and construct
+        the extrapolated F(Q) on the Fourier transform grid q_fq."""
         psq = (data["i_normalized"] - data["f_sq_ave"]) / data["f_ave_sq"]
         psq = psq * self.get_revised_lorch(data["q"])
-        data["sq"] = psq + 1.0
 
+        # 1. Measured experimental data strictly on data["q"] (strictly no extrapolation)
+        data["sq"] = psq + 1.0
+        data["fq"] = data["q"] * psq
+
+        # 2. Fourier transform grid q_fq from 0.0 to qmax for DST
         qmax = float(self["qmax"])
         if qmax >= data["q"][-1]:
             qmax = float(data["q"][-1])
@@ -900,11 +930,14 @@ class PDFget(OrochiBase):
         step = data["q"][1] - data["q"][0]
         n_fq = int(np.round(qmax / step)) + 1
         data["q_fq"] = np.linspace(0.0, qmax, n_fq)
+
+        # Extrapolated F(Q) array on q_fq: connects (0.0, 0.0) to (q_0, fq_0)
         x = np.append(0.0, data["q"])
-        y = np.append(0.0, psq * data["q"])
-        data["fq"] = intp.interp1d(
+        y = np.append(0.0, data["fq"])
+        data["fq_grid"] = intp.interp1d(
             x, y, "linear", bounds_error=False, fill_value="extrapolate"
         )(data["q_fq"])
+        data["fq_extrapolated"] = data["fq_grid"]
 
         return data
 
